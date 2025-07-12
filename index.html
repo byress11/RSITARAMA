@@ -656,9 +656,12 @@
         // Konfigürasyon
         const CONFIG = {
             CORS_PROXY: 'https://api.allorigins.win/raw?url=',
-            API_DELAY: 100, // ms
-            MAX_RETRIES: 3,
-            TIMEOUT: 10000 // ms
+            BACKUP_PROXY: 'https://corsproxy.io/?',
+            API_DELAY: 50, // ms - Reduced delay
+            MAX_RETRIES: 2, // Reduced retries
+            TIMEOUT: 5000, // ms - Reduced timeout
+            BATCH_SIZE: 10, // Parallel processing batch size
+            MAX_CONCURRENT: 5 // Maximum concurrent requests
         };
 
         // BIST Hisse Listesi (Güncellenmiş - Tüm Pazarlar)
@@ -944,31 +947,69 @@
 
         // Data Fetching
         const DataFetcher = {
-            async fetchWithRetry(url, retries = CONFIG.MAX_RETRIES) {
-                for (let i = 0; i < retries; i++) {
-                    try {
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT);
-                        
-                        const response = await fetch(url, {
-                            signal: controller.signal,
-                            headers: {
-                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                            }
-                        });
-                        
-                        clearTimeout(timeoutId);
-                        
-                        if (!response.ok) {
-                            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            // Semaphore for controlling concurrent requests
+            semaphore: {
+                current: 0,
+                max: CONFIG.MAX_CONCURRENT,
+                queue: [],
+                
+                async acquire() {
+                    return new Promise((resolve) => {
+                        if (this.current < this.max) {
+                            this.current++;
+                            resolve();
+                        } else {
+                            this.queue.push(resolve);
                         }
-                        
-                        return await response.json();
-                        
-                    } catch (error) {
-                        if (i === retries - 1) throw error;
-                        await Utils.delay(1000 * (i + 1)); // Exponential backoff
+                    });
+                },
+                
+                release() {
+                    this.current--;
+                    if (this.queue.length > 0) {
+                        this.current++;
+                        const resolve = this.queue.shift();
+                        resolve();
                     }
+                }
+            },
+
+            async fetchWithRetry(url, retries = CONFIG.MAX_RETRIES) {
+                await this.semaphore.acquire();
+                
+                try {
+                    for (let i = 0; i < retries; i++) {
+                        try {
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT);
+                            
+                            // Try primary proxy first, then backup
+                            const proxyUrl = i === 0 ? 
+                                CONFIG.CORS_PROXY + encodeURIComponent(url) :
+                                CONFIG.BACKUP_PROXY + encodeURIComponent(url);
+                            
+                            const response = await fetch(proxyUrl, {
+                                signal: controller.signal,
+                                headers: {
+                                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                                }
+                            });
+                            
+                            clearTimeout(timeoutId);
+                            
+                            if (!response.ok) {
+                                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                            }
+                            
+                            return await response.json();
+                            
+                        } catch (error) {
+                            if (i === retries - 1) throw error;
+                            await Utils.delay(500 * (i + 1)); // Reduced backoff
+                        }
+                    }
+                } finally {
+                    this.semaphore.release();
                 }
             },
 
@@ -978,9 +1019,8 @@
                     const interval = timeframe;
                     
                     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.IS?period1=0&period2=9999999999&interval=${interval}&includePrePost=false`;
-                    const proxyUrl = CONFIG.CORS_PROXY + encodeURIComponent(url);
                     
-                    const data = await this.fetchWithRetry(proxyUrl);
+                    const data = await this.fetchWithRetry(url);
                     
                     if (!data.chart || !data.chart.result || data.chart.result.length === 0) {
                         throw new Error('No data available');
@@ -1017,6 +1057,19 @@
                     console.error(`Error fetching data for ${symbol}:`, error.message);
                     return null;
                 }
+            },
+
+            // Batch processing for parallel data fetching
+            async fetchStockDataBatch(symbols, timeframe = '1d') {
+                const promises = symbols.map(symbol => 
+                    this.fetchStockData(symbol, timeframe)
+                        .catch(error => {
+                            console.error(`Batch error for ${symbol}:`, error.message);
+                            return null;
+                        })
+                );
+                
+                return await Promise.all(promises);
             }
         };
 
@@ -1087,18 +1140,96 @@
                 }
                 
                 return { success: false, reason: 'No signals found' };
+            },
+
+            // Batch analysis for parallel processing
+            async analyzeStockBatch(symbols, timeframe, rsiPeriod, rsiThreshold, rsiDirection) {
+                const dataResults = await DataFetcher.fetchStockDataBatch(symbols, timeframe);
+                const results = [];
+                
+                for (let i = 0; i < symbols.length; i++) {
+                    const symbol = symbols[i];
+                    const data = dataResults[i];
+                    
+                    if (!data || data.length < 50) {
+                        continue;
+                    }
+                    
+                    try {
+                        const ohlc4 = TechnicalAnalysis.calculateOHLC4(data);
+                        const rsi = TechnicalAnalysis.calculateRSI(ohlc4, rsiPeriod);
+                        
+                        if (rsi.length < 2) continue;
+                        
+                        const currentRsi = rsi[rsi.length - 1];
+                        const previousRsi = rsi[rsi.length - 2];
+                        const currentPrice = data[data.length - 1].close;
+                        const volume = data[data.length - 1].volume;
+                        
+                        // RSI yönüne göre temel kriter kontrolü
+                        let basicCriteria = false;
+                        let signalDescription = '';
+                        
+                        if (rsiDirection === 'above') {
+                            basicCriteria = currentRsi > rsiThreshold && currentRsi > previousRsi;
+                            signalDescription = 'RSI>' + rsiThreshold + ' (Güçlü)';
+                        } else {
+                            basicCriteria = currentRsi < rsiThreshold && currentRsi > previousRsi;
+                            signalDescription = 'RSI<' + rsiThreshold + ' (Aşırı Satım)';
+                        }
+                        
+                        // Bullish divergence tespiti (sadece aşırı satım durumunda)
+                        const divergenceResult = rsiDirection === 'below' ? 
+                            TechnicalAnalysis.detectBullishDivergence(ohlc4, rsi, {
+                                shortLookback: 5,
+                                longLookback: 34,
+                                reversalPct: 0.02,
+                                oversoldLevel: rsiThreshold,
+                                minRsiStrength: 5.0
+                            }) : { detected: false };
+                        
+                        if (basicCriteria || divergenceResult.detected) {
+                            const signalTypes = [];
+                            if (basicCriteria) signalTypes.push(signalDescription);
+                            if (divergenceResult.detected) signalTypes.push('BULLISH_DIV');
+                            
+                            results.push({
+                                symbol,
+                                currentPrice,
+                                currentRsi,
+                                previousRsi,
+                                rsiChange: currentRsi - previousRsi,
+                                signalType: signalTypes.join(' + '),
+                                volume,
+                                timestamp: data[data.length - 1].timestamp,
+                                divergenceStrength: divergenceResult.strength || 0,
+                                rsiDirection
+                            });
+                        }
+                    } catch (error) {
+                        console.error(`Analysis error for ${symbol}:`, error.message);
+                    }
+                }
+                
+                return results;
             }
         };
 
         // UI Controller
         const UIController = {
-            updateProgress(current, total, symbol) {
+            updateProgress(current, total, message) {
                 const progressFill = document.getElementById('progressFill');
                 const progressText = document.getElementById('progressText');
                 
                 const progress = (current / total) * 100;
                 progressFill.style.width = progress + '%';
-                progressText.textContent = `${symbol} analiz ediliyor... (${current}/${total})`;
+                
+                // Better progress message formatting
+                if (message.includes('Batch')) {
+                    progressText.textContent = `${message} - ${current}/${total} hisse işlendi (${Math.round(progress)}%)`;
+                } else {
+                    progressText.textContent = `${message} analiz ediliyor... (${current}/${total})`;
+                }
             },
 
             showProgress() {
@@ -1237,25 +1368,39 @@
             UIController.showProgress();
             
             try {
-                for (let i = 0; i < stocksToScan.length; i++) {
+                // Batch processing for parallel execution
+                const batchSize = CONFIG.BATCH_SIZE;
+                const totalBatches = Math.ceil(stocksToScan.length / batchSize);
+                
+                for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
                     if (scanAbortController.signal.aborted) {
                         throw new Error('Scan cancelled');
                     }
                     
-                    const symbol = stocksToScan[i];
-                    UIController.updateProgress(i + 1, stocksToScan.length, symbol);
+                    const startIndex = batchIndex * batchSize;
+                    const endIndex = Math.min(startIndex + batchSize, stocksToScan.length);
+                    const batchStocks = stocksToScan.slice(startIndex, endIndex);
+                    
+                    // Update progress
+                    UIController.updateProgress(endIndex, stocksToScan.length, 
+                        `Batch ${batchIndex + 1}/${totalBatches} (${batchStocks.join(', ')})`);
                     
                     try {
-                        const result = await StockAnalyzer.analyzeStock(symbol, timeframe, rsiPeriod, rsiThreshold, rsiDirection);
-                        if (result.success) {
-                            scanResults.push(result.data);
-                        }
+                        // Parallel batch analysis
+                        const batchResults = await StockAnalyzer.analyzeStockBatch(
+                            batchStocks, timeframe, rsiPeriod, rsiThreshold, rsiDirection
+                        );
+                        
+                        scanResults.push(...batchResults);
+                        
                     } catch (error) {
-                        console.error(`Analysis error for ${symbol}:`, error.message);
+                        console.error(`Batch ${batchIndex + 1} error:`, error.message);
                     }
                     
-                    // API rate limiting
-                    await Utils.delay(CONFIG.API_DELAY);
+                    // Small delay between batches to prevent overwhelming the API
+                    if (batchIndex < totalBatches - 1) {
+                        await Utils.delay(CONFIG.API_DELAY);
+                    }
                 }
                 
                 UIController.displayResults();
