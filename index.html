@@ -1444,25 +1444,32 @@
             });
             
             // Stock limit change listener
-            document.getElementById('stockLimit').addEventListener('input', updateFilterInfo);
+            document.getElementById('stockLimit').addEventListener('blur', updateFilterInfo);
             
             // RSI direction and threshold change listeners
             document.getElementById('rsiDirection').addEventListener('change', updateFilterInfo);
-            document.getElementById('rsiThreshold').addEventListener('input', updateFilterInfo);
+            document.getElementById('rsiThreshold').addEventListener('blur', updateFilterInfo);
             
             // Input validation
             const inputs = document.querySelectorAll('input[type="number"]');
             inputs.forEach(input => {
-                input.addEventListener('input', function() {
+                input.addEventListener('blur', function() {
                     const min = parseInt(this.min);
                     const max = parseInt(this.max);
                     const value = parseInt(this.value);
                     
-                    if (value < min) this.value = min;
+                    if (isNaN(value) || value < min) this.value = min;
                     if (value > max) this.value = max;
                     
                     if (this.id === 'stockLimit') {
                         updateFilterInfo();
+                    }
+                });
+                
+                // Enter tuşu ile de validation yap
+                input.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        this.blur(); // Blur event'ini tetikle
                     }
                 });
             });
